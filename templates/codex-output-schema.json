@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "overall_risk": { "type": "string", "enum": ["Minor", "Major", "Blocker"] },
+    "summary": { "type": "string" },
+    "comments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "start_line": { "type": "integer", "minimum": 1 },
+          "end_line": { "type": "integer", "minimum": 1 },
+          "severity": { "type": "string", "enum": ["Minor", "Major", "Blocker"] },
+          "body": { "type": "string" }
+        },
+        "required": ["path", "start_line", "end_line", "severity", "body"]
+      }
+    }
+  },
+  "required": ["overall_risk", "summary", "comments"]
+}
