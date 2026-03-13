@@ -1,0 +1,283 @@
+name: Codex PR Review (Fork-safe)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  codex_review:
+    name: Codex PR Review
+    runs-on: ubuntu-latest
+
+    steps:
+      # Gate by label + draft to control cost and avoid noisy runs
+      - name: Gate Codex review by labels + draft status
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const labels = (pr.labels || []).map(l => (l.name || '').toLowerCase());
+            const allowed = ['requires-review'];
+            const hasAllowedLabel = labels.some(l => allowed.includes(l));
+            const isFork = pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`;
+            const runCodex = !pr.draft && hasAllowedLabel && !isFork;
+            core.setOutput('has_allowed_label', hasAllowedLabel ? 'true' : 'false');
+            core.setOutput('run_codex', runCodex ? 'true' : 'false');
+            core.setOutput('is_fork', isFork ? 'true' : 'false');
+
+      # Fast exit with a clear reason when review is gated off
+      - name: Skip notice (labels/draft)
+        if: ${{ steps.gate.outputs.run_codex != 'true' }}
+        run: |
+          echo "Codex review skipped: PR is draft or required label (requires-review) is missing."
+
+      # Checkout is needed to read rubric files and write prompt/output artifacts
+      - name: Checkout base repository (safe)
+        if: ${{ steps.gate.outputs.run_codex == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Incremental review: only diff from the last Codex-reviewed commit
+      - name: Find last Codex review commit (incremental diff)
+        if: ${{ steps.gate.outputs.run_codex == 'true' }}
+        id: review_base
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const botLogins = new Set(['github-actions[bot]']);
+
+            function extractSha(text) {
+              if (!text) return null;
+              const match = text.match(/Reviewed commit:\s*([0-9a-f]{7,40})/i);
+              return match ? match[1] : null;
+            }
+
+            let lastReviewedSha = null;
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100
+            });
+
+            for (const review of reviews.sort((a, b) => new Date(b.submitted_at || 0) - new Date(a.submitted_at || 0))) {
+              if (!review.user || !botLogins.has(review.user.login)) continue;
+              const sha = extractSha(review.body || '');
+              if (sha) { lastReviewedSha = sha; break; }
+            }
+
+            if (!lastReviewedSha) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                per_page: 100
+              });
+
+              for (const comment of comments.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))) {
+                if (!comment.user || !botLogins.has(comment.user.login)) continue;
+                const sha = extractSha(comment.body || '');
+                if (sha) { lastReviewedSha = sha; break; }
+              }
+            }
+
+            const baseSha = lastReviewedSha || pr.base.sha;
+            const headSha = pr.head.sha;
+            const isIncremental = Boolean(lastReviewedSha);
+            const sameSha = baseSha === headSha;
+
+            core.setOutput('base_sha', baseSha);
+            core.setOutput('head_sha', headSha);
+            core.setOutput('is_incremental', isIncremental ? 'true' : 'false');
+            core.setOutput('same_sha', sameSha ? 'true' : 'false');
+
+      # Pull only the incremental diff and cap size to control token usage
+      - name: Download PR patch (diff) safely (retry + size guard)
+        if: ${{ steps.gate.outputs.run_codex == 'true' && steps.review_base.outputs.same_sha != 'true' }}
+        run: |
+          set -e
+
+          COMPARE_URL="https://api.github.com/repos/${{ github.repository }}/compare/${{ steps.review_base.outputs.base_sha }}...${{ steps.review_base.outputs.head_sha }}"
+
+          curl -sSL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github.v3.patch" \
+            "${COMPARE_URL}" \
+            -o /tmp/pr.diff
+
+          sed -i '/^Binary files /d' /tmp/pr.diff
+
+          DIFF_BYTES=$(wc -c < /tmp/pr.diff)
+          echo "PR diff size (bytes): ${DIFF_BYTES}"
+
+          if [ ! -s /tmp/pr.diff ]; then
+            echo "EMPTY_DIFF=true" >> $GITHUB_ENV
+          else
+            echo "EMPTY_DIFF=false" >> $GITHUB_ENV
+          fi
+
+          MAX_BYTES=200000
+          if [ "${DIFF_BYTES}" -gt "${MAX_BYTES}" ]; then
+            echo "Diff is larger than ${MAX_BYTES} bytes; trimming to last ${MAX_BYTES} bytes."
+            tail -c ${MAX_BYTES} /tmp/pr.diff > /tmp/pr.trimmed.diff
+            mv /tmp/pr.trimmed.diff /tmp/pr.diff
+            echo "TRIMMED_DIFF=true" >> $GITHUB_ENV
+          else
+            echo "TRIMMED_DIFF=false" >> $GITHUB_ENV
+          fi
+
+          echo "Diff preview (first 25 lines):"
+          head -n 25 /tmp/pr.diff
+
+      # Build the prompt: rubric + incremental diff (no repo context)
+      - name: Compose Codex prompt (rubric + diff)
+        if: ${{ steps.gate.outputs.run_codex == 'true' && steps.review_base.outputs.same_sha != 'true' && env.EMPTY_DIFF == 'false' }}
+        run: |
+          mkdir -p .codex/tmp
+          cat .github/codex-review-guidelines.md > .codex/tmp/prompt.md
+          echo "" >> .codex/tmp/prompt.md
+
+          echo "IMPORTANT:" >> .codex/tmp/prompt.md
+          echo "- Review ONLY the PR DIFF below." >> .codex/tmp/prompt.md
+          echo "- Use ONLY paths and line numbers that exist in the diff." >> .codex/tmp/prompt.md
+          echo "- If you cannot provide valid inline comments, return an empty comments array." >> .codex/tmp/prompt.md
+          echo "" >> .codex/tmp/prompt.md
+
+          if [ "${{ steps.review_base.outputs.is_incremental }}" = "true" ]; then
+            echo "NOTE: This is an incremental review since the last Codex review commit." >> .codex/tmp/prompt.md
+            echo "Only review changes introduced after the last review." >> .codex/tmp/prompt.md
+            echo "" >> .codex/tmp/prompt.md
+          fi
+
+          if [ "${TRIMMED_DIFF}" = "true" ]; then
+            echo "NOTE: The PR diff was trimmed due to size limits. Focus on the visible changes and mention that review may be partial." >> .codex/tmp/prompt.md
+            echo "" >> .codex/tmp/prompt.md
+          fi
+
+          echo "----- PR DIFF -----" >> .codex/tmp/prompt.md
+          echo "" >> .codex/tmp/prompt.md
+          cat /tmp/pr.diff >> .codex/tmp/prompt.md
+
+          echo "Prompt bytes: $(wc -c < .codex/tmp/prompt.md)"
+
+      # Avoid calling the model when there is no new diff
+      - name: Comment when diff is empty (skip Codex)
+        if: ${{ steps.gate.outputs.run_codex == 'true' && (steps.review_base.outputs.same_sha == 'true' || env.EMPTY_DIFF == 'true') }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const pr = context.payload.pull_request;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: "### Codex Review\nI couldn't generate a PR diff for this change (empty patch or no changes since the last review). If this PR is already up-to-date or contains only metadata, there may be nothing to review.\n\n**Overall Risk:** Minor\n\nReviewed commit: " + pr.head.sha
+            });
+
+      # Run the structured review and validate output schema
+      - name: Run Codex structured PR review (JSON)
+        if: ${{ steps.gate.outputs.run_codex == 'true' && steps.review_base.outputs.same_sha != 'true' && env.EMPTY_DIFF == 'false' }}
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .codex/tmp/prompt.md
+          output-schema-file: codex-output-schema.json
+          output-file: codex-review.json
+          effort: medium
+
+      # Post only valid inline comments (line numbers must exist in diff)
+      - name: Post inline PR comments (validated against diff hunks)
+        if: ${{ steps.gate.outputs.run_codex == 'true' && steps.review_base.outputs.same_sha != 'true' && env.EMPTY_DIFF == 'false' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+
+            const data = JSON.parse(fs.readFileSync('codex-review.json', 'utf8'));
+            const pr = context.payload.pull_request;
+
+            const comments = Array.isArray(data.comments) ? data.comments : [];
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100
+            });
+
+            function buildValidLines(patch) {
+              const valid = new Set();
+              if (!patch) return valid;
+
+              let newLine = 0;
+              for (const line of patch.split('\n')) {
+                if (line.startsWith('@@')) {
+                  const match = /\+([0-9]+)/.exec(line);
+                  if (match) newLine = Number(match[1]);
+                  continue;
+                }
+                if (line.startsWith('+++') || line.startsWith('---')) continue;
+
+                if (line.startsWith('+')) { valid.add(newLine); newLine += 1; continue; }
+                if (line.startsWith(' ')) { valid.add(newLine); newLine += 1; continue; }
+                if (line.startsWith('-')) { continue; }
+              }
+              return valid;
+            }
+
+            const validLinesByPath = new Map();
+            for (const file of files) {
+              validLinesByPath.set(file.filename, buildValidLines(file.patch));
+            }
+
+            function isValidInlineComment(c) {
+              if (!c || typeof c.path !== 'string' || !Number.isInteger(c.end_line)) return false;
+              if (!c.path.trim() || c.path === 'N/A') return false;
+
+              const validLines = validLinesByPath.get(c.path);
+              if (!validLines || validLines.size === 0) return false;
+
+              return validLines.has(c.end_line);
+            }
+
+            const validComments = comments.filter(isValidInlineComment).slice(0, 50);
+
+            const body = `### Codex Review\n${data.summary || ''}\n\n**Overall Risk:** ${data.overall_risk || 'Minor'}\n\nReviewed commit: ${pr.head.sha}`;
+
+            if (validComments.length === 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body
+              });
+              return;
+            }
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              commit_id: pr.head.sha,
+              event: 'COMMENT',
+              body,
+              comments: validComments.map(c => ({
+                path: c.path,
+                line: c.end_line,
+                side: 'RIGHT',
+                body: `**Severity: ${c.severity}**\n\n${c.body}`
+              }))
+            });
